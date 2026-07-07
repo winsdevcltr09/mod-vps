@@ -3,13 +3,19 @@ NTFY_TOPIC="${NTFY_TOPIC:-render-vps}"
 BOT_PASSWORD="${BOT_PASSWORD:-rairukun2025}"
 HTTP_PORT="${PORT:-8080}"
 SSH_PORT=2222
-TUNNEL_LOG="/tmp/serveo.log"
+BORE_LOG="/tmp/bore.log"
+BORE_SERVER="bore.pub"
+BORE_PORT=3977
 
 echo "============================================="
 echo "  mod-vps starting ($(date -u))"
-echo "  tunnel: serveo.net"
+echo "  tunnel: bore.pub (via hardcoded IP)"
 echo "  ntfy  : ntfy.sh/$NTFY_TOPIC"
 echo "============================================="
+
+# Fix DNS issue on Render Singapore: hardcode bore.pub IP
+echo "159.223.110.159 bore.pub" >> /etc/hosts
+echo "[0/4] /etc/hosts patched for bore.pub"
 
 echo "root:${BOT_PASSWORD}" | chpasswd
 
@@ -20,45 +26,39 @@ mkdir -p /run/sshd && ssh-keygen -A 2>/dev/null
 echo "[1/4] Starting sshd on port $SSH_PORT..."
 /usr/sbin/sshd && echo "      sshd OK"
 
-ssh-keygen -t ed25519 -f /tmp/serveo_key -N "" -q 2>/dev/null
+echo "[2/4] Downloading bore v0.6.0..."
+BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
+wget -q -O /tmp/bore.tar.gz "$BORE_URL" && tar -xz -C /usr/local/bin -f /tmp/bore.tar.gz && chmod +x /usr/local/bin/bore
+bore --version && echo "      bore OK"
 
-echo "[2/4] Connecting to serveo.net tunnel..."
-rm -f "$TUNNEL_LOG"
-# -v for verbose so we see "Allocated port XXXX" in stderr
-ssh -i /tmp/serveo_key \
-    -v \
-    -o StrictHostKeyChecking=no \
-    -o ServerAliveInterval=30 \
-    -o ServerAliveCountMax=3 \
-    -o ExitOnForwardFailure=yes \
-    -R "0:localhost:$SSH_PORT" \
-    serveo.net > "$TUNNEL_LOG" 2>&1 &
-TUNNEL_PID=$!
+echo "[3/4] Starting bore tunnel: localhost:$SSH_PORT -> $BORE_SERVER..."
+rm -f "$BORE_LOG"
+bore local $SSH_PORT --to $BORE_SERVER:$BORE_PORT > "$BORE_LOG" 2>&1 &
+BORE_PID=$!
 
-SERVEO_PORT=""
+BORE_ADDR=""
 for i in $(seq 1 30); do
   sleep 2
-  RAW=$(cat "$TUNNEL_LOG" 2>/dev/null)
-  # SSH -v outputs: "Allocated port 12345 for remote forward to localhost:2222"
-  SERVEO_PORT=$(echo "$RAW" | grep -oP "(?i)Allocated port \K\d+")
-  LAST_LINE=$(echo "$RAW" | grep -v "^$" | tail -1)
-  echo "      [${i}x2s] last: ${LAST_LINE:0:80}"
-  if [ -n "$SERVEO_PORT" ]; then break; fi
-  if ! kill -0 $TUNNEL_PID 2>/dev/null; then
-    echo "      serveo died, restarting..."
-    ssh -i /tmp/serveo_key -v \
-        -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
-        -R "0:localhost:$SSH_PORT" serveo.net >> "$TUNNEL_LOG" 2>&1 &
-    TUNNEL_PID=$!
+  RAW=$(cat "$BORE_LOG" 2>/dev/null)
+  BORE_ADDR=$(echo "$RAW" | grep -oP "(?<=listening at )\S+:\d+")
+  LAST=$(echo "$RAW" | grep -v "^$" | tail -1)
+  echo "      [${i}x2s] $LAST"
+  if [ -n "$BORE_ADDR" ]; then break; fi
+  if ! kill -0 $BORE_PID 2>/dev/null; then
+    echo "      bore died, restart..."
+    bore local $SSH_PORT --to $BORE_SERVER:$BORE_PORT >> "$BORE_LOG" 2>&1 &
+    BORE_PID=$!
   fi
 done
 
-echo "[3/4] Sending ntfy notification..."
-if [ -n "$SERVEO_PORT" ]; then
+echo "[4/4] Sending ntfy notification..."
+if [ -n "$BORE_ADDR" ]; then
+  BORE_HOST=$(echo "$BORE_ADDR" | cut -d: -f1)
+  BORE_REMOTE_PORT=$(echo "$BORE_ADDR" | cut -d: -f2)
   MSG="SSH VPS Render AKTIF!
 
 Perintah koneksi:
-ssh root@serveo.net -p ${SERVEO_PORT}
+ssh root@${BORE_HOST} -p ${BORE_REMOTE_PORT}
 Password: ${BOT_PASSWORD}
 
 Waktu: $(date -u '+%H:%M UTC')"
@@ -68,19 +68,19 @@ Waktu: $(date -u '+%H:%M UTC')"
     -d "$MSG" > /dev/null 2>&1
   echo "      Notifikasi terkirim ✓"
   echo "============================================="
-  echo "  ssh root@serveo.net -p ${SERVEO_PORT}"
+  echo "  ssh root@${BORE_HOST} -p ${BORE_REMOTE_PORT}"
   echo "  Password: ${BOT_PASSWORD}"
   echo "============================================="
 else
-  echo "      Tunnel timeout! Log:"
-  cat "$TUNNEL_LOG" | tail -20
+  echo "      Bore timeout! Log:"
+  cat "$BORE_LOG"
   curl -s -X POST "https://ntfy.sh/${NTFY_TOPIC}" \
-    -H "Title: SSH VPS Render - Tunnel Gagal" \
+    -H "Title: SSH VPS Render - Bore Gagal" \
     -H "Priority: urgent" -H "Tags: warning" \
-    -d "Tunnel gagal. Log: $(cat $TUNNEL_LOG | tail -5 | tr '\n' ' ')" > /dev/null 2>&1
+    -d "Bore gagal. Log: $(cat $BORE_LOG | tail -5 | tr '\n' ' ')" > /dev/null 2>&1
 fi
 
-echo "[4/4] HTTP health server on :$HTTP_PORT..."
+# HTTP health check (required by Render)
 python3 -c "
 import http.server,os
 class H(http.server.BaseHTTPRequestHandler):
