@@ -3,14 +3,11 @@ NTFY_TOPIC="${NTFY_TOPIC:-render-vps}"
 BOT_PASSWORD="${BOT_PASSWORD:-rairukun2025}"
 HTTP_PORT="${PORT:-8080}"
 SSH_PORT=2222
-BORE_LOG="/tmp/bore.log"
-# bore.pub IP hardcoded (bypass DNS - Render Singapore cannot resolve bore.pub)
-BORE_SERVER="159.223.110.159"
-BORE_PORT=3977
+TUNNEL_LOG="/tmp/tunnel.log"
 
 echo "============================================="
 echo "  mod-vps starting ($(date -u))"
-echo "  tunnel: bore.pub ($BORE_SERVER:$BORE_PORT)"
+echo "  tunnel: pinggy.io:443 (TCP)"
 echo "  ntfy  : ntfy.sh/$NTFY_TOPIC"
 echo "============================================="
 
@@ -23,41 +20,46 @@ mkdir -p /run/sshd && ssh-keygen -A 2>/dev/null
 echo "[1/4] Starting sshd on port $SSH_PORT..."
 /usr/sbin/sshd && echo "      sshd OK"
 
-echo "[2/4] Downloading bore v0.6.0..."
-wget -q -O /tmp/bore.tar.gz "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz" \
-  && tar -xz -C /usr/local/bin -f /tmp/bore.tar.gz \
-  && chmod +x /usr/local/bin/bore \
-  && echo "      bore $(bore --version 2>&1)"
+echo "[2/4] Connecting pinggy.io tunnel via port 443..."
+rm -f "$TUNNEL_LOG"
+# pinggy.io: free TCP tunnel via SSH on port 443
+# Output: tcp://TOKEN.a.pinggy.io:PORT or similar
+ssh -p 443 \
+    -o StrictHostKeyChecking=no \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=no \
+    -o LogLevel=VERBOSE \
+    -R "0:localhost:$SSH_PORT" \
+    a.pinggy.io > "$TUNNEL_LOG" 2>&1 &
+TUNNEL_PID=$!
 
-echo "[3/4] Starting bore tunnel: localhost:$SSH_PORT -> $BORE_SERVER:$BORE_PORT..."
-rm -f "$BORE_LOG"
-# Use IP directly (musl libc bore binary may not read /etc/hosts)
-bore local $SSH_PORT --to $BORE_SERVER:$BORE_PORT > "$BORE_LOG" 2>&1 &
-BORE_PID=$!
-
-BORE_ADDR=""
+TUNNEL_ADDR=""
 for i in $(seq 1 30); do
   sleep 2
-  RAW=$(cat "$BORE_LOG" 2>/dev/null)
-  # bore output: "listening at bore.pub:PORT"
-  BORE_ADDR=$(echo "$RAW" | grep -oP "listening at \K\S+:\d+")
+  RAW=$(cat "$TUNNEL_LOG" 2>/dev/null)
+  # Pinggy output: "tcp://HOST:PORT" or "Forwarding tcp connections from HOST:PORT"
+  TUNNEL_ADDR=$(echo "$RAW" | grep -oP "tcp://\S+:\d+|(?<=from )\S+:\d+" | head -1)
   LAST=$(echo "$RAW" | grep -v "^$" | tail -1)
   echo "      [${i}x2s] ${LAST:0:80}"
-  if [ -n "$BORE_ADDR" ]; then break; fi
-  if ! kill -0 $BORE_PID 2>/dev/null; then
-    echo "      bore died, restart..."
-    bore local $SSH_PORT --to $BORE_SERVER:$BORE_PORT >> "$BORE_LOG" 2>&1 &
-    BORE_PID=$!
+  if [ -n "$TUNNEL_ADDR" ]; then break; fi
+  if ! kill -0 $TUNNEL_PID 2>/dev/null; then
+    echo "      pinggy died, restarting..."
+    ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+        -o LogLevel=VERBOSE \
+        -R "0:localhost:$SSH_PORT" a.pinggy.io >> "$TUNNEL_LOG" 2>&1 &
+    TUNNEL_PID=$!
   fi
 done
 
-echo "[4/4] Sending ntfy notification..."
-if [ -n "$BORE_ADDR" ]; then
-  BORE_REMOTE_PORT=$(echo "$BORE_ADDR" | grep -oP "\d+$")
+echo "[3/4] Sending ntfy notification..."
+if [ -n "$TUNNEL_ADDR" ]; then
+  # Extract host:port from tcp://host:port
+  CONN=$(echo "$TUNNEL_ADDR" | sed 's|tcp://||')
   MSG="SSH VPS Render AKTIF!
 
 Perintah koneksi:
-ssh root@bore.pub -p ${BORE_REMOTE_PORT}
+ssh root@${CONN%:*} -p ${CONN##*:}
 Password: ${BOT_PASSWORD}
 
 Waktu: $(date -u '+%H:%M UTC')"
@@ -67,19 +69,19 @@ Waktu: $(date -u '+%H:%M UTC')"
     -d "$MSG" > /dev/null 2>&1
   echo "      Notifikasi terkirim ✓"
   echo "============================================="
-  echo "  ssh root@bore.pub -p ${BORE_REMOTE_PORT}"
+  echo "  $TUNNEL_ADDR"
   echo "  Password: ${BOT_PASSWORD}"
   echo "============================================="
 else
-  echo "      Bore timeout! Full log:"
-  cat "$BORE_LOG"
+  echo "      Tunnel timeout! Log:"
+  cat "$TUNNEL_LOG" | tail -20
   curl -s -X POST "https://ntfy.sh/${NTFY_TOPIC}" \
-    -H "Title: SSH VPS Render - Bore Gagal" \
+    -H "Title: SSH VPS Render - Tunnel Gagal" \
     -H "Priority: urgent" -H "Tags: warning" \
-    -d "Bore gagal (IP=$BORE_SERVER). Log: $(cat $BORE_LOG | tail -5 | tr '\n' ' ')" > /dev/null 2>&1
+    -d "pinggy gagal. Log: $(cat $TUNNEL_LOG | tail -8 | tr '\n' ' ')" > /dev/null 2>&1
 fi
 
-# HTTP health check (required by Render - must respond on $PORT)
+# HTTP health check (required by Render)
 python3 -c "
 import http.server,os
 class H(http.server.BaseHTTPRequestHandler):
