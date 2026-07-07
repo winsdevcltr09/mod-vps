@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: mod-vps-ssh
+    env: docker
+    repo: https://github.com/winsdevcltr09/mod-vps
+    region: singapore
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: BOT_PASSWORD
+        value: rairukun2025
+      - key: BORE_SERVER
+        value: bore.pub
+      - key: BORE_PORT
+        value: "3977"
+      - key: NTFY_TOPIC
+        value: render-vps
