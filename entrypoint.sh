@@ -4,18 +4,15 @@ BOT_PASSWORD="${BOT_PASSWORD:-rairukun2025}"
 HTTP_PORT="${PORT:-8080}"
 SSH_PORT=2222
 BORE_LOG="/tmp/bore.log"
-BORE_SERVER="bore.pub"
+# bore.pub IP hardcoded (bypass DNS - Render Singapore cannot resolve bore.pub)
+BORE_SERVER="159.223.110.159"
 BORE_PORT=3977
 
 echo "============================================="
 echo "  mod-vps starting ($(date -u))"
-echo "  tunnel: bore.pub (via hardcoded IP)"
+echo "  tunnel: bore.pub ($BORE_SERVER:$BORE_PORT)"
 echo "  ntfy  : ntfy.sh/$NTFY_TOPIC"
 echo "============================================="
-
-# Fix DNS issue on Render Singapore: hardcode bore.pub IP
-echo "159.223.110.159 bore.pub" >> /etc/hosts
-echo "[0/4] /etc/hosts patched for bore.pub"
 
 echo "root:${BOT_PASSWORD}" | chpasswd
 
@@ -27,12 +24,14 @@ echo "[1/4] Starting sshd on port $SSH_PORT..."
 /usr/sbin/sshd && echo "      sshd OK"
 
 echo "[2/4] Downloading bore v0.6.0..."
-BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
-wget -q -O /tmp/bore.tar.gz "$BORE_URL" && tar -xz -C /usr/local/bin -f /tmp/bore.tar.gz && chmod +x /usr/local/bin/bore
-bore --version && echo "      bore OK"
+wget -q -O /tmp/bore.tar.gz "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz" \
+  && tar -xz -C /usr/local/bin -f /tmp/bore.tar.gz \
+  && chmod +x /usr/local/bin/bore \
+  && echo "      bore $(bore --version 2>&1)"
 
-echo "[3/4] Starting bore tunnel: localhost:$SSH_PORT -> $BORE_SERVER..."
+echo "[3/4] Starting bore tunnel: localhost:$SSH_PORT -> $BORE_SERVER:$BORE_PORT..."
 rm -f "$BORE_LOG"
+# Use IP directly (musl libc bore binary may not read /etc/hosts)
 bore local $SSH_PORT --to $BORE_SERVER:$BORE_PORT > "$BORE_LOG" 2>&1 &
 BORE_PID=$!
 
@@ -40,9 +39,10 @@ BORE_ADDR=""
 for i in $(seq 1 30); do
   sleep 2
   RAW=$(cat "$BORE_LOG" 2>/dev/null)
-  BORE_ADDR=$(echo "$RAW" | grep -oP "(?<=listening at )\S+:\d+")
+  # bore output: "listening at bore.pub:PORT"
+  BORE_ADDR=$(echo "$RAW" | grep -oP "listening at \K\S+:\d+")
   LAST=$(echo "$RAW" | grep -v "^$" | tail -1)
-  echo "      [${i}x2s] $LAST"
+  echo "      [${i}x2s] ${LAST:0:80}"
   if [ -n "$BORE_ADDR" ]; then break; fi
   if ! kill -0 $BORE_PID 2>/dev/null; then
     echo "      bore died, restart..."
@@ -53,12 +53,11 @@ done
 
 echo "[4/4] Sending ntfy notification..."
 if [ -n "$BORE_ADDR" ]; then
-  BORE_HOST=$(echo "$BORE_ADDR" | cut -d: -f1)
-  BORE_REMOTE_PORT=$(echo "$BORE_ADDR" | cut -d: -f2)
+  BORE_REMOTE_PORT=$(echo "$BORE_ADDR" | grep -oP "\d+$")
   MSG="SSH VPS Render AKTIF!
 
 Perintah koneksi:
-ssh root@${BORE_HOST} -p ${BORE_REMOTE_PORT}
+ssh root@bore.pub -p ${BORE_REMOTE_PORT}
 Password: ${BOT_PASSWORD}
 
 Waktu: $(date -u '+%H:%M UTC')"
@@ -68,19 +67,19 @@ Waktu: $(date -u '+%H:%M UTC')"
     -d "$MSG" > /dev/null 2>&1
   echo "      Notifikasi terkirim ✓"
   echo "============================================="
-  echo "  ssh root@${BORE_HOST} -p ${BORE_REMOTE_PORT}"
+  echo "  ssh root@bore.pub -p ${BORE_REMOTE_PORT}"
   echo "  Password: ${BOT_PASSWORD}"
   echo "============================================="
 else
-  echo "      Bore timeout! Log:"
+  echo "      Bore timeout! Full log:"
   cat "$BORE_LOG"
   curl -s -X POST "https://ntfy.sh/${NTFY_TOPIC}" \
     -H "Title: SSH VPS Render - Bore Gagal" \
     -H "Priority: urgent" -H "Tags: warning" \
-    -d "Bore gagal. Log: $(cat $BORE_LOG | tail -5 | tr '\n' ' ')" > /dev/null 2>&1
+    -d "Bore gagal (IP=$BORE_SERVER). Log: $(cat $BORE_LOG | tail -5 | tr '\n' ' ')" > /dev/null 2>&1
 fi
 
-# HTTP health check (required by Render)
+# HTTP health check (required by Render - must respond on $PORT)
 python3 -c "
 import http.server,os
 class H(http.server.BaseHTTPRequestHandler):
